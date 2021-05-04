@@ -236,3 +236,486 @@ Filecoin依赖于这个系统时钟，以确保共识安全。具体来说，时
 
 TODO：这里需要更加详细的介绍一下。
 
+## 文件和数据
+
+Filecoin的主要目的是存储客户的文件和数据。本节详细介绍与文件、分块(chunking)、编码、图表示、片段(Pieces)、存储抽象等相关的数据结构和工具。
+
+#### 文件
+
+文件是一个可变长度的数据容器。
+
+FileStore是一个可以按路径存储和检索文件的对象。FileStore是一个抽象概念，用于Filecoin将其数据存储到的任何底层系统或设备。它基于Unix文件系统语义，并包含路径的概念。这里的这种抽象是为了确保Filecoin的实现使最终用户能够轻松地使用任何满足他们需求的存储系统来替换底层存储系统。FileStore最简单的版本就是主机操作系统的文件系统。
+
+提出FileStore的抽象是为了应对不同的用户需求。Filecoin用户的需求差异很大，许多用户——尤其是矿工——将在Filecoin底层和周边实现复杂的存储架构。这里的FileStore抽象是为了使这些多样化的需求容易满足。Filecoin协议中的所有文件和扇区的本地数据存储都是根据这个FileStore接口定义的，这使得存储实现可以很容易地替换，最终用户可以替换为他们选择的存储系统。
+
+存储系统案例：
+
+* 主机操作系统的文件系统
+* 任何Unix/Posix文件系统
+* RAID-backed文件系统
+* 分布式文件系统(NFS、HDFS等)
+* IPFS
+* 数据库
+* NAS系统
+* 原始串行或块设备
+* 原始硬盘驱动器(硬盘扇区等)
+
+#### Filecoin数据片段（Piece）
+
+Filecoin Piece是用户在Filecoin网络上存储数据的主要协商单元。Filecoin Piece不是一个存储单元，它没有特定大小，而是以扇区的大小为上限。一个Filecoin Piece可以是任意大小，但如果一个Piece大于矿工支持的扇区的大小，它必须被拆分为更多的Pieces，以便每个Piece适合一个扇区。
+
+Piece是一个表示文件整体或部分的对象，用于存储客户和存储矿工的交易中。存储客户端雇佣存储矿工来存储Piece。
+
+Piece数据结构设计用于证明存储任意IPLD图和客户端数据。此图显示了Piece及其证明树的详细组成，包括完整的和带宽优化的Piece数据结构。
+
+https://spec.filecoin.io/systems/filecoin_files/piece/pieces.png （TODO：重画此图，或者拿到这个图的原文件）![Minion](https://spec.filecoin.io/systems/filecoin_files/piece/pieces.png )
+
+
+
+#### 数据表示
+
+需要强调的是，提交到Filecoin网络的数据需要经过多次转换，才能成为StorageProvider的存储格式。下面是从用户开始准备要存储在Filecoin中的文件，到StorageProvider生成存储在Sector中的所有Pieces标识符的过程。
+
+前三个步骤发生在**客户端**：
+
+1. 当客户端希望在Filecoin网络中存储文件时，他们首先生成文件的IPLD DAG。DAG根节点的散列是ipfs风格的CID，称为有效载荷CID。
+2. 为了生成一个Filecoin Piece，IPLD DAG被序列化为一个“内容-可寻址存档”(.car)文件（TODO ： CAR文件格式介绍 https://github.com/ipld/specs/blob/master/block-layer/content-addressable-archives.md#summary ），CAR是原始字节格式。CAR文件是不透明的数据块，它将IPLD节点打包并传输。有效载荷CID在CAR 'ed和非CAR 'ed结构之间是相同的（TODO：？？）。这有助于稍后的数据检索（TODO：当数据在存储客户和存储提供者之间传输时(我们将在后面讨论)）。
+3. 生成的.car文件被额外的零位填充，以使该文件形成一个二进制Merkle树。为了实现一个干净的二进制Merkle树，.car文件大小必须是2(^2)大小的幂次。一个填充过程，称为Fr32填充，它将每256位中的254位加2(2)个零位写入到输入文件。下一步，填充过程获取Fr32填充过程的输出，并找到大于它的2的幂值。Fr32填充的结果和2的下一个幂值之间的差距用0填充（TODO：这里描述还不够清晰和准确）。
+
+（TODO：设计原因，内容和Piece CID一一对应，内容一旦确定，CID就确定）为了理解这些步骤背后的原因，了解StorageClient和StorageProvider之间的整体协商过程是很重要的。CID或CommP是客户与存储提供商协商并同意的交易内容。当协议达成后，客户端将文件发送给提供者(使用GraphSync)。提供者必须从接收到的文件中构造CAR文件，并派生出他们一方的Piece CID。为了避免客户端向约定的一方发送不同的文件，提供者生成的Piece CID必须与之前协商的交易中包含的相同。
+
+以下步骤发生在**StorageProvider端**(步骤4也可以发生在客户端)。
+
+4. 一旦StorageProvider从客户端接收到文件，它们就从Piece(填充的.car文件)的散列中计算Merkle根。干净二叉Merkle树的结果根是Piece CID。这也被称为CommP或Piece Commitment，如前所述，必须与交易中包含的承诺相同。
+5. Piece与来自其他交易的数据一起包含在一个Sector中。然后StorageProvider计算扇区内所有Pieces的Merkle根。该树的根是CommD(又名committed of Data或UnsealedSectorCID)。
+6. 然后StorageProvider密封扇区，产生的Merkle根是CommRLast。
+7. 复制证明(PoRep)，特别是SDR，会生成另一个名为CommC的Merkle根哈希，作为对CommD承诺的数据的复制已经正确执行的验证。
+8. 最后，CommR(或Commitment of Replication)是CommC || CommRLast的哈希值。
+
+TODO：这里一段需要结合实际文件存储过程来解释清楚。
+
+重要提示:
+
+* Fr32是字段元素的32位表示(在我们的例子中，它是BLS12-381的算术字段)。为了格式良好，类型Fr32的值必须实际适合该字段，但类型系统并不强制这样做。它是一个不变量，必须通过正确的使用来保持。在所谓的Fr32填充的情况下，在一个最多需要254位来表示的数字后面插入两个零位。这保证了结果将是Fr32，而不管最初的254位的值是多少。这是一种“保守的”技术，因为对于一些初始值，实际上只需要一个位的零填充。
+* 上面的第2步和第3步特定于Lotus实现。同样的结果可以通过不同的方式实现，例如，不使用Fr32位填充。然而，任何实现都必须确保初始IPLD DAG被序列化和填充，以便它给出一个干净的二叉树，因此，从结果数据blob计算Merkle根给出相同的Piece CID。只要是这种情况，实现就可以偏离上面的前三个步骤。
+* 最后，添加一个与Payload CID(在上面的前两个步骤中讨论)和数据检索过程相关的注释是很重要的。检索协议是在有效载荷CID的基础上协商的。当检索协议达成后，检索矿机开始向客户机发送未密封的“非car’ed”文件。传输从IPLD Merkle树的根节点开始，通过这种方式，客户端可以从传输开始验证Payload CID，并验证他们正在接收的文件是他们在交易中协商的文件，而不是随机比特。
+
+#### PieceStore
+PieceStore模块允许从一些本地存储中存储和检索Pieces。PieceStore的主要目标是帮助存储和检索市场模块找到密封数据在各个Sector的位置。存储市场写数据，检索市场读数据，然后发送给检索客户端。
+
+PieceStore模块的实现可以在这里找到：https://github.com/filecoin-project/go-fil-markets/tree/master/piecestore
+
+## Filecoin的数据传输
+
+数据传输协议是一种协议，用于在交易完成时在网络上传输全部或部分Piece数据。数据传输模块的总体目标是使其成为底层传输介质的抽象，使得数据可以在Filecoin网络的不同参与方之间传输。目前，
+
+实际用于进行数据传输的底层媒介或协议是GraphSync。因此，数据传输协议也可以被认为是一个协商协议。
+
+数据传输协议主要用于存储和检索交易。在这两种情况下，数据传输请求都是由客户端发起。这样做的主要原因是，客户端通常会在NAT网络的后面，因此，从客户端发起开始任何数据传输都更方便。
+
+* 在Storage Deals的场景下，数据传输请求作为推送（push request）请求发起，以将数据发送到存储提供者。
+* 在Retrieval Deals的场景下，数据传输请求被存储提供者作为检索数据的拉请求（pull request）发起。
+
+发起数据传输的请求内容包括一个凭单（voucher）或通证（不要与支付通道凭单混淆），凭单是指向双方之前同意的特定交易。这样存储提供者就可以识别并将请求链接到它已经同意的交易，而不是忽略该请求。如下面所述，检索交易的情况可能略有不同，其中交易提议和数据传输请求可以同时发送。
+
+#### 数据传输模块
+
+这张图显示了数据传输及其模块如何与存储市场和检索市场相交互。特别要注意，来自市场的数据传输请求验证器是如何插入到数据传输模块的，但是它们的代码属于市场系统（TODO：这里需要进一步的阐述清楚，并重画此图）。
+
+![data_transfer](https://spec.filecoin.io/systems/filecoin_files/data_transfer/data-transfer-modules.png)
+
+#### 数据传输中的术语
+
+* 发送请求（Push Request）：请求向另一方发送数据——通常由客户端发起，主要是在存储交易的场景下。
+* 拉取请求（Pull Request）：请求另一方发送数据给自己——通常由客户端发起，主要是在检索交易的场景下。
+* 请求者（Requestor）：发起数据传输请求的一方(Push或Pull)——通常是客户端，至少目前在Filecoin中实现中是这样，以克服NAT穿越问题。
+* 响应者（Responder）：接收数据传输请求的一方——通常是存储提供者。
+* 数据传输凭证或令牌（Data Transfer Voucher or Token）：存储数据或检索数据的包装器，可以识别并验证向对方的传输请求。
+* 请求验证器（Request Validator）：只有当响应者可以验证请求是直接关联到已有的存储交易或检索交易时，数据传输模块才会启动传输。数据传输模块本身不执行验证。相反，请求验证器检查数据传输凭证，以决定是响应请求还是拒绝请求。
+* 数据传输器（Transporter）:一旦完成请求协商和请求验证，实际的传输将由双方的数据传输器（Transporter）管理。传输器是数据传输模块的一部分，但与协商过程隔离。它可以访问底层的可验证传输协议，并使用它发送数据和跟踪进度。
+* 订阅者（Subscriber）：通过订阅数据传输事件（如进行中或已完成）来监视数据传输进度的外部组件。
+* GraphSync：数据传输器（Transporter）使用的默认底层传输协议。完整的图形同步规范可以在这里找到：https://github.com/ipld/specs/blob/master/block-layer/graphsync/graphsync.md
+
+#### 请求阶段
+
+任何数据传输都有两个基本阶段:
+
+* 协商：请求者和响应者通过验证数据传输凭证来达成传输交易。
+* 传输：一旦协商阶段完成，数据就开始传输。用于数据传输的默认协议是Graphsync。
+
+注意，协商阶段和传输阶段可能发生在单独的消息往返过程中，也可能发生在相同的消息往返过程中。在相同往返的情况下，请求方通过发送请求隐式地包含同意交易，而响应方可以同意交易并立即发送或接收数据。这个过程是发生在单次消息往返还是多次消息往返，部分取决于请求是push请求（存储交易）还是pull请求（检索处理），以及数据传输协商过程是否能够顺表使用底层传输机制。在GraphSync作为传输机制的情况下，数据传输请求可以使用GraphSync内置的可扩展性作为GraphSync协议的扩展。因此，Pull Requests只需要一次往返。然而，因为Graphsync是一个请求/响应协议，对push类型的请求没有直接支持，在push类型的请求中，协商过程发生在数据传输模块的libp2p协议`/fil/ datattransfer /1.0.0`的单独请求中。未来其他的传输机制可能同时处理Push和Pull，或者两者都不作为一个单一的往返行程。
+
+在接收到数据传输请求后，数据传输模块对凭证进行解码，并将其交付给请求验证器。在存储交易中，请求验证器检查包含的交易是否是接收方以前同意的交易。对于检索处理，请求提议包含了检索交易本身。只要请求验证器接受交易提议，所有的事情都是一次性完成的。
+
+值得注意的是，在检索交易的场景下，数据提供者可以接受交易请求和数据传输请求，然后暂停检索服务本身，以执行解封过程。存储提供者必须在启动真正的数据传输之前解封所有被请求的数据。此外，存储提供者还可以选择在解封过程开始之前暂停检索数据流，以便请求解封支付请求。存储提供者可以选择请求支付这笔费用，以支付解封计算成本，并避免成为恶意检索行为攻击的受害者（TODO：评估现在网络中发生这种共攻击的风险）。
+
+#### 数据流示例
+
+###### 推送数据流
+
+1. 当请求者想要向另一方发送数据时，它会发起Push传输。
+2. 请求者的数据传输模块将向响应者发送一个推送请求以及数据传输凭证。
+3. 响应者的数据传输模块通过其依赖的验证器（Validator）验证数据传输请求。
+4. 响应者的数据传输模块通过发出一个GraphSync请求来启动传输。
+5. 请求者接收GraphSync请求，验证它是否识别了数据传输，并开始发送数据。
+6. 响应者接收数据并能产生进度指示。
+7. 响应者完成接收数据，并通知任何订阅者。
+
+push流是存储交易的理想选择，在这种情况下，一旦提供者表示他们愿意接受并发布客户的交易提议，客户端就会直接发起数据传输。
+
+![push](https://spec.filecoin.io/_gen/diagrams/systems/filecoin_files/data_transfer/push-flow.svg)
+
+###### 拉取数据流
+
+1. 当请求者想从另一方拉取数据时，它会发起Pull传输。
+2. 请求者的数据传输模块通过向响应者发送一个嵌入GraphSync请求中的pull请求来发起传输。该请求包括数据传输凭证。
+3. 响应者接收GraphSync请求，并将数据传输请求转发给数据传输模块。
+4. 响应者的数据传输模块通过其依赖的PullValidator来验证数据传输请求。
+5. 响应者接受GraphSync请求，并将接受响应与数据传输响应一起发送。
+6. 请求者接收数据并产生进度指示。这个步骤的时机是在存储提供者完成对数据的解封之后。
+7. 请求者完成接收数据，并通知任何监听者。
+
+![pull](https://spec.filecoin.io/_gen/diagrams/systems/filecoin_files/data_transfer/alternate-pull-flow.svg)
+
+#### 协议
+
+数据传输可以通过数据传输协议(一种libp2p协议类型)在网络上进行协商。
+
+使用数据传输协议作为一个独立的libp2p通信机制并不是一个硬性要求——只要双方都有一个可以相互通信的数据传输子系统的实现，任何传输机制(包括脱机机制)都是可以的。
+
+#### 数据结构
+
+###### 数据传输类型
+
+```
+package datatransfer
+
+import (
+	"fmt"
+
+	"github.com/ipfs/go-cid"
+	"github.com/ipld/go-ipld-prime"
+	"github.com/libp2p/go-libp2p-core/peer"
+
+	"github.com/filecoin-project/go-data-transfer/encoding"
+)
+
+//go:generate cbor-gen-for ChannelID
+
+// TypeIdentifier is a unique string identifier for a type of encodable object in a
+// registry
+type TypeIdentifier string
+
+// EmptyTypeIdentifier means there is no voucher present
+const EmptyTypeIdentifier = TypeIdentifier("")
+
+// Registerable is a type of object in a registry. It must be encodable and must
+// have a single method that uniquely identifies its type
+type Registerable interface {
+	encoding.Encodable
+	// Type is a unique string identifier for this voucher type
+	Type() TypeIdentifier
+}
+
+// Voucher is used to validate
+// a data transfer request against the underlying storage or retrieval deal
+// that precipitated it. The only requirement is a voucher can read and write
+// from bytes, and has a string identifier type
+type Voucher Registerable
+
+// VoucherResult is used to provide option additional information about a
+// voucher being rejected or accepted
+type VoucherResult Registerable
+
+// TransferID is an identifier for a data transfer, shared between
+// request/responder and unique to the requester
+type TransferID uint64
+
+// ChannelID is a unique identifier for a channel, distinct by both the other
+// party's peer ID + the transfer ID
+type ChannelID struct {
+	Initiator peer.ID
+	Responder peer.ID
+	ID        TransferID
+}
+
+func (c ChannelID) String() string {
+	return fmt.Sprintf("%s-%s-%d", c.Initiator, c.Responder, c.ID)
+}
+
+// OtherParty returns the peer on the other side of the request, depending
+// on whether this peer is the initiator or responder
+func (c ChannelID) OtherParty(thisPeer peer.ID) peer.ID {
+	if thisPeer == c.Initiator {
+		return c.Responder
+	}
+	return c.Initiator
+}
+
+// Channel represents all the parameters for a single data transfer
+type Channel interface {
+	// TransferID returns the transfer id for this channel
+	TransferID() TransferID
+
+	// BaseCID returns the CID that is at the root of this data transfer
+	BaseCID() cid.Cid
+
+	// Selector returns the IPLD selector for this data transfer (represented as
+	// an IPLD node)
+	Selector() ipld.Node
+
+	// Voucher returns the voucher for this data transfer
+	Voucher() Voucher
+
+	// Sender returns the peer id for the node that is sending data
+	Sender() peer.ID
+
+	// Recipient returns the peer id for the node that is receiving data
+	Recipient() peer.ID
+
+	// TotalSize returns the total size for the data being transferred
+	TotalSize() uint64
+
+	// IsPull returns whether this is a pull request
+	IsPull() bool
+
+	// ChannelID returns the ChannelID for this request
+	ChannelID() ChannelID
+
+	// OtherPeer returns the counter party peer for this channel
+	OtherPeer() peer.ID
+}
+
+// ChannelState is channel parameters plus it's current state
+type ChannelState interface {
+	Channel
+
+	// SelfPeer returns the peer this channel belongs to
+	SelfPeer() peer.ID
+
+	// Status is the current status of this channel
+	Status() Status
+
+	// Sent returns the number of bytes sent
+	Sent() uint64
+
+	// Received returns the number of bytes received
+	Received() uint64
+
+	// Message offers additional information about the current status
+	Message() string
+
+	// Vouchers returns all vouchers sent on this channel
+	Vouchers() []Voucher
+
+	// VoucherResults are results of vouchers sent on the channel
+	VoucherResults() []VoucherResult
+
+	// LastVoucher returns the last voucher sent on the channel
+	LastVoucher() Voucher
+
+	// LastVoucherResult returns the last voucher result sent on the channel
+	LastVoucherResult() VoucherResult
+
+	// ReceivedCids returns the cids received so far on the channel
+	ReceivedCids() []cid.Cid
+
+	// Queued returns the number of bytes read from the node and queued for sending
+	Queued() uint64
+}
+```
+
+TODO：分析解读以上代码
+
+
+
+###### 数据传输状态
+
+```
+package datatransfer
+
+// Status is the status of transfer for a given channel
+type Status uint64
+
+const (
+	// Requested means a data transfer was requested by has not yet been approved
+	Requested Status = iota
+
+	// Ongoing means the data transfer is in progress
+	Ongoing
+
+	// TransferFinished indicates the initiator is done sending/receiving
+	// data but is awaiting confirmation from the responder
+	TransferFinished
+
+	// ResponderCompleted indicates the initiator received a message from the
+	// responder that it's completed
+	ResponderCompleted
+
+	// Finalizing means the responder is awaiting a final message from the initator to
+	// consider the transfer done
+	Finalizing
+
+	// Completing just means we have some final cleanup for a completed request
+	Completing
+
+	// Completed means the data transfer is completed successfully
+	Completed
+
+	// Failing just means we have some final cleanup for a failed request
+	Failing
+
+	// Failed means the data transfer failed
+	Failed
+
+	// Cancelling just means we have some final cleanup for a cancelled request
+	Cancelling
+
+	// Cancelled means the data transfer ended prematurely
+	Cancelled
+
+	// InitiatorPaused means the data sender has paused the channel (only the sender can unpause this)
+	InitiatorPaused
+
+	// ResponderPaused means the data receiver has paused the channel (only the receiver can unpause this)
+	ResponderPaused
+
+	// BothPaused means both sender and receiver have paused the channel seperately (both must unpause)
+	BothPaused
+
+	// ResponderFinalizing is a unique state where the responder is awaiting a final voucher
+	ResponderFinalizing
+
+	// ResponderFinalizingTransferFinished is a unique state where the responder is awaiting a final voucher
+	// and we have received all data
+	ResponderFinalizingTransferFinished
+
+	// ChannelNotFoundError means the searched for data transfer does not exist
+	ChannelNotFoundError
+)
+
+// Statuses are human readable names for data transfer states
+var Statuses = map[Status]string{
+	// Requested means a data transfer was requested by has not yet been approved
+	Requested:                           "Requested",
+	Ongoing:                             "Ongoing",
+	TransferFinished:                    "TransferFinished",
+	ResponderCompleted:                  "ResponderCompleted",
+	Finalizing:                          "Finalizing",
+	Completing:                          "Completing",
+	Completed:                           "Completed",
+	Failing:                             "Failing",
+	Failed:                              "Failed",
+	Cancelling:                          "Cancelling",
+	Cancelled:                           "Cancelled",
+	InitiatorPaused:                     "InitiatorPaused",
+	ResponderPaused:                     "ResponderPaused",
+	BothPaused:                          "BothPaused",
+	ResponderFinalizing:                 "ResponderFinalizing",
+	ResponderFinalizingTransferFinished: "ResponderFinalizingTransferFinished",
+	ChannelNotFoundError:                "ChannelNotFoundError",
+}
+```
+
+TODO：分析解读以上代码
+
+
+
+###### 数据传输管理器
+
+Manager是所有数据传输子系统的核心接口。
+
+```
+type Manager interface {
+
+	// Start initializes data transfer processing
+	Start(ctx context.Context) error
+
+	// OnReady registers a listener for when the data transfer comes on line
+	OnReady(ReadyFunc)
+
+	// Stop terminates all data transfers and ends processing
+	Stop(ctx context.Context) error
+
+	// RegisterVoucherType registers a validator for the given voucher type
+	// will error if voucher type does not implement voucher
+	// or if there is a voucher type registered with an identical identifier
+	RegisterVoucherType(voucherType Voucher, validator RequestValidator) error
+
+	// RegisterRevalidator registers a revalidator for the given voucher type
+	// Note: this is the voucher type used to revalidate. It can share a name
+	// with the initial validator type and CAN be the same type, or a different type.
+	// The revalidator can simply be the sampe as the original request validator,
+	// or a different validator that satisfies the revalidator interface.
+	RegisterRevalidator(voucherType Voucher, revalidator Revalidator) error
+
+	// RegisterVoucherResultType allows deserialization of a voucher result,
+	// so that a listener can read the metadata
+	RegisterVoucherResultType(resultType VoucherResult) error
+
+	// RegisterTransportConfigurer registers the given transport configurer to be run on requests with the given voucher
+	// type
+	RegisterTransportConfigurer(voucherType Voucher, configurer TransportConfigurer) error
+
+	// open a data transfer that will send data to the recipient peer and
+	// transfer parts of the piece that match the selector
+	OpenPushDataChannel(ctx context.Context, to peer.ID, voucher Voucher, baseCid cid.Cid, selector ipld.Node) (ChannelID, error)
+
+	// open a data transfer that will request data from the sending peer and
+	// transfer parts of the piece that match the selector
+	OpenPullDataChannel(ctx context.Context, to peer.ID, voucher Voucher, baseCid cid.Cid, selector ipld.Node) (ChannelID, error)
+
+	// send an intermediate voucher as needed when the receiver sends a request for revalidation
+	SendVoucher(ctx context.Context, chid ChannelID, voucher Voucher) error
+
+	// close an open channel (effectively a cancel)
+	CloseDataTransferChannel(ctx context.Context, chid ChannelID) error
+
+	// pause a data transfer channel (only allowed if transport supports it)
+	PauseDataTransferChannel(ctx context.Context, chid ChannelID) error
+
+	// resume a data transfer channel (only allowed if transport supports it)
+	ResumeDataTransferChannel(ctx context.Context, chid ChannelID) error
+
+	// get status of a transfer
+	TransferChannelStatus(ctx context.Context, x ChannelID) Status
+
+	// get notified when certain types of events happen
+	SubscribeToEvents(subscriber Subscriber) Unsubscribe
+
+	// get all in progress transfers
+	InProgressChannels(ctx context.Context) (map[ChannelID]ChannelState, error)
+
+	// RestartDataTransferChannel restarts an existing data transfer channel
+	RestartDataTransferChannel(ctx context.Context, chid ChannelID) error
+}
+```
+
+TODO：分析解读以上代码
+
+## 数据格式和序列化
+
+Filecoin力求尽可能少地使用数据格式，通过规范良好的序列化规则，通过简单性和互操作性（支持Filecoin协议实现之间）来提高协议安全性。
+
+阅读更多关于cbor使用和Filecoin中int类型的设计注意事项：
+
+https://github.com/filecoin-project/specs/issues/621
+
+https://github.com/filecoin-project/specs/issues/615
+
+#### 数据格式
+Filecoin内存中的数据类型通常很简单。实现应该支持两种整型：Int（表示本机64位整型）和BigInt（表示任意长度），并避免处理浮点数，以最大限度地减少跨编程语言和实现的互操作性问题。
+
+您还可以阅读更多关于Filecoin协议中随机生成的数据格式的内容。
+
+https://spec.filecoin.io/#section-algorithms.crypto.randomness
+
+#### 序列化
+Filecoin中的数据序列化确保了在传输中和存储中内存数据序列化的一致格式。序列化对于协议安全性和跨Filecoin协议实现的互操作性至关重要，它允许Filecoin进行一致的跨节点状态更新。
+
+Filecoin中的所有数据结构都是cbor元组编码的。也就是说，Filecoin系统中使用的任何数据结构（本规范中的结构）都应该序列化为cbor数组，其中包含与数据结构字段对应的项，这些项按照声明的顺序排列。
+
+您可以在这里找到cbo中主要数据类型的编码结构：https://tools.ietf.org/html/rfc7049#section-2.1
+
+举例来说，内存中的映射将表示为按预先确定的顺序列出的键和值的cbor数组。短期对序列化格式的更新将涉及适当地标记字段，以确保随着协议的发展进行适当的序列化/反序列化。
+
