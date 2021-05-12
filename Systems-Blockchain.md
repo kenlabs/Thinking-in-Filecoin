@@ -980,13 +980,370 @@ ChainSync使用以下概念状态机。由于这是一个概念性的状态机�
 * BV7 -消息签名:
 * BV8 -状态树：父tipset消息执行产生的状态树树根和收据。
 
-
-
-
-
 #### 存储算力共识
 
+存储算力共识（Storage Power Consensus，SPC）子系统是使得Filecoin节点就系统状态达成一致的主要接口。存储算力共识在其算力表中描述了给定区块链中单个存储矿工（区块生产者）相对于共识的有效算力。它还运行预期共识（Filecoin使用的底层共识算法)，使存储矿工（区块生产者）能够运行领导者选举并生成新区块来更新Filecoin系统的状态。
+
+简单地说，SPC子系统提供以下服务：
+
+* 每个子链对算力表的访问，包括单个存储矿工（区块生产者）的算力和链上总算力。
+
+* 访问单个存储矿工（区块生产者）的预期共识，使:
+  * 访问由drand提供的可验证随机性ticket，drand为协议的其余部分服务。
+  * 运行领导者选举产生新的区块。
+  * 使用预期共识（EC）的加权函数对多个子链的进行选择。
+  * 标识最近完成的tipset，供所有协议参与者使用。
+
+###### 区分存储矿工和区块矿工
+
+有两种方法在Filecoin网络中获得Filecoin通证:
+
+* 以存储提供者的身份参与存储市场，并由客户为文件存储交易付费。
+* 通过生产新的区块，扩展区块链，保障Filecoin共识安全，并作为存储矿工运行智能合约执行状态更新。
+
+有两种类型的“矿工（区块生产者）”（存储矿工和区块矿工）需要区分。Filecoin中的领袖选举是基于矿工的存储能力。因此，虽然所有的区块矿工都将是存储矿工，但存储矿工不一定是区块矿工。
+
+然而，由于Filecoin的“有用工作量证明”是通过文件存储（PoRep和PoSt）实现的，存储矿工参与领导者选举的开销很小。这样的存储矿工Actor只需要向存储算力Actor注册，就可以参与预期共识和区块生产。
 
 
 
+###### 关于算力
+质量调整算力作为扇区质量的静态函数分配给各个扇区，包括：
 
+* i)扇区的时空，这是扇区大小承诺存储时间的乘积
+*  ii)  交易权重，将交易占据的时空转换成共识
+* iii)交易质量乘数取决于扇区上交易的类型（例如,CC常规交易或验证客户端交易),
+* 后,iv)扇区质量乘数，这是交易质量乘数的平均值，权重为扇区中每种类型的交易所占据的时空数量。
+
+扇区质量是一种衡量方法，它将一个扇区在其生命周期内的规模、持续时间和活跃交易类型，映射到其对算力和奖励分配的影响。
+
+一个扇区的质量取决于该扇区内部的数据承载的交易。通常有三种类型的交易：
+
+* 承诺容量（Committed Capacity ，CC），实际上是空交易，区块生产者存储任意数据在扇区内部
+* 常规交易（*Regular Deals*），区块生产者（存储矿工）和客户在市场上就价格达成一致。
+* 验证客户交易（*Verified Client* deals），赋予扇区更多的算力。关于扇区类型和扇区质量的详细信息，请参阅扇区和扇区质量部分；关于验证客户；请参阅验证客户部分；关于交易权重和质量乘数的具体参数值，请参阅加密经济学部分（TODO）。
+
+质量调整算力（Quality-Adjusted Power）是一个矿工在秘密领导者选举中拥有的选票数量，并被定义为随着一个矿工承诺给网络的有用存储线性增加。
+
+更准确地说，我们有以下定义:
+
+原始字节算力：扇区的大小(以字节为单位)。
+质量调整算力：在网络上存储的数据所具备的共识算力，等于原始字节算力乘以扇区质量乘数。
+
+
+
+###### 信标项
+
+Filecoin协议使用drand信标产生的随机性来作为在区块链中使用的无偏随机性种子（参见随机性）。
+
+反过来，这些随机的种子被用于:
+
+* sector_sealer：作为SealSeeds将扇区承诺绑定到给定的子链。
+* post_generator：作为PoStChallenges来证明扇区在给定区块（epoch）仍然处于有效的提交状态。
+* 在Secret Leader Election中，存储算力子系统作为随机性来决定一个矿工（区块生产者）被选择产生一个新区块的频率。
+
+这种随机性可能来自Filecoin区块链不同的epoch，由各自的协议根据其安全需求使用它们。
+
+需要注意的是，给定的Filecoin网络和给定的drand网络不需要相同的轮次时间，也就是说，Filecoin生成的区块可能比drand生成的随机性更快或更慢。例如，如果drand信标产生随机性的速度是Filecoin产生区块的两倍，我们可能会期望在一个Filecoin epoch中产生两个随机值，相反，如果Filecoin网络的速度是drand的两倍，我们可能会期望每隔一个Filecoin epoch就产生一个随机值。相应地，根据两个网络的配置，某些Filecoin区块可能包含多个drand项，也可能不包含drand项。此外，在网络中断期间对drand网络的任何新的随机条目的调用都必须被阻塞，如下面的drand. public()调用所示。在所有情况下，Filecoin区块必须包含自最后一个epoch以来在区块头的BeaconEntries字段中生成的所有drand信标输出。任何对给定Filecoin epoch的随机性的使用都应该使用Filecoin区块中包含的最后一个有效drand项。（TODO：这一段，需要根据代码重新梳理一下）。如下所示。
+
+**为VM获取drand随机性**
+对于PoRep创建、证明验证或任何需要Filecoin VM随机性的操作，应该有一个方法可以正确地从链中提取drand项。请注意，如果drand较慢，round可能跨越多个filecoin epoch；最低epoch的区块将包含请求的信标项。类似地，如果在信标应该被插入的地方存在空轮（空块？），我们需要在链上迭代以找到条目被插入的位置（迭代，这里的意思是向后面推迟）。具体来说，下一个非空区块必须包含根据定义请求的drand项（下一个非空区块需要包含drand项）。（TODO：这里需要根据代码确定的更准确）
+
+**从drand网络获取随机性**
+当挖矿时，矿工可以从drand网络获取随机项，并将随机项打包在新区块中。
+
+DrandBeacon将Lotus与drand网络连接起来，以一种与Filecoin轮数/epoch一致的方式为系统提供随机性。
+
+我们通过DrandBeacon 对等节点的公共HTTP端点连接到drand对等节点。对等节点存储在drandServers的枚举变量中。
+
+Drand链的根信任是从build.DrandChain配置的。
+
+```
+ype DrandBeacon struct {
+	client dclient.Client
+
+	pubkey kyber.Point
+
+	// seconds
+	interval time.Duration
+
+	drandGenTime uint64
+	filGenTime   uint64
+	filRoundTime uint64
+
+	cacheLk    sync.Mutex
+	localCache map[uint64]types.BeaconEntry
+}
+```
+
+区块的信标项：
+
+```
+func BeaconEntriesForBlock(ctx context.Context, bSchedule Schedule, epoch abi.ChainEpoch, parentEpoch abi.ChainEpoch, prev types.BeaconEntry) ([]types.BeaconEntry, error) {
+	{
+		parentBeacon := bSchedule.BeaconForEpoch(parentEpoch)
+		currBeacon := bSchedule.BeaconForEpoch(epoch)
+		if parentBeacon != currBeacon {
+			// Fork logic
+			round := currBeacon.MaxBeaconRoundForEpoch(epoch)
+			out := make([]types.BeaconEntry, 2)
+			rch := currBeacon.Entry(ctx, round-1)
+			res := <-rch
+			if res.Err != nil {
+				return nil, xerrors.Errorf("getting entry %d returned error: %w", round-1, res.Err)
+			}
+			out[0] = res.Entry
+			rch = currBeacon.Entry(ctx, round)
+			res = <-rch
+			if res.Err != nil {
+				return nil, xerrors.Errorf("getting entry %d returned error: %w", round, res.Err)
+			}
+			out[1] = res.Entry
+			return out, nil
+		}
+	}
+
+	beacon := bSchedule.BeaconForEpoch(epoch)
+
+	start := build.Clock.Now()
+
+	maxRound := beacon.MaxBeaconRoundForEpoch(epoch)
+	if maxRound == prev.Round {
+		return nil, nil
+	}
+
+	// TODO: this is a sketchy way to handle the genesis block not having a beacon entry
+	if prev.Round == 0 {
+		prev.Round = maxRound - 1
+	}
+
+	cur := maxRound
+	var out []types.BeaconEntry
+	for cur > prev.Round {
+		rch := beacon.Entry(ctx, cur)
+		select {
+		case resp := <-rch:
+			if resp.Err != nil {
+				return nil, xerrors.Errorf("beacon entry request returned error: %w", resp.Err)
+			}
+
+			out = append(out, resp.Entry)
+			cur = resp.Entry.Round - 1
+		case <-ctx.Done():
+			return nil, xerrors.Errorf("context timed out waiting on beacon entry to come back for epoch %d: %w", epoch, ctx.Err())
+		}
+	}
+
+	log.Debugw("fetching beacon entries", "took", build.Clock.Since(start), "numEntries", len(out))
+	reverse(out)
+	return out, nil
+}
+```
+
+epoch的最大信标轮次
+
+```
+func (db *DrandBeacon) MaxBeaconRoundForEpoch(filEpoch abi.ChainEpoch) uint64 {
+	// TODO: sometimes the genesis time for filecoin is zero and this goes negative
+	latestTs := ((uint64(filEpoch) * db.filRoundTime) + db.filGenTime) - db.filRoundTime
+	dround := (latestTs - db.drandGenTime) / uint64(db.interval.Seconds())
+	return dround
+}
+```
+
+**验证接收区块上的信标项**
+Filecoin区块链将包含从Filecoin创世区块到当前区块的信标链输出的全部内容。
+
+考虑到信标项在领导者选举和Filecoin其他关键协议中所扮演的角色，一个区块的信标项必须对每个区块进行验证。详情见drand部分。通过确保每个信标项都是区块链中前一个信标项的有效签名，这可以rand 's Verify端点来实现这一点（校验区块值）:
+
+```
+func ValidateBlockValues(bSchedule Schedule, h *types.BlockHeader, parentEpoch abi.ChainEpoch,
+	prevEntry types.BeaconEntry) error {
+	{
+		parentBeacon := bSchedule.BeaconForEpoch(parentEpoch)
+		currBeacon := bSchedule.BeaconForEpoch(h.Height)
+		if parentBeacon != currBeacon {
+			if len(h.BeaconEntries) != 2 {
+				return xerrors.Errorf("expected two beacon entries at beacon fork, got %d", len(h.BeaconEntries))
+			}
+			err := currBeacon.VerifyEntry(h.BeaconEntries[1], h.BeaconEntries[0])
+			if err != nil {
+				return xerrors.Errorf("beacon at fork point invalid: (%v, %v): %w",
+					h.BeaconEntries[1], h.BeaconEntries[0], err)
+			}
+			return nil
+		}
+	}
+
+	// TODO: fork logic
+	b := bSchedule.BeaconForEpoch(h.Height)
+	maxRound := b.MaxBeaconRoundForEpoch(h.Height)
+	if maxRound == prevEntry.Round {
+		if len(h.BeaconEntries) != 0 {
+			return xerrors.Errorf("expected not to have any beacon entries in this block, got %d", len(h.BeaconEntries))
+		}
+		return nil
+	}
+
+	if len(h.BeaconEntries) == 0 {
+		return xerrors.Errorf("expected to have beacon entries in this block, but didn't find any")
+	}
+
+	last := h.BeaconEntries[len(h.BeaconEntries)-1]
+	if last.Round != maxRound {
+		return xerrors.Errorf("expected final beacon entry in block to be at round %d, got %d", maxRound, last.Round)
+	}
+
+	for i, e := range h.BeaconEntries {
+		if err := b.VerifyEntry(e, prevEntry); err != nil {
+			return xerrors.Errorf("beacon entry %d (%d - %x (%d)) was invalid: %w", i, e.Round, e.Data, len(e.Data), err)
+		}
+		prevEntry = e
+	}
+
+	return nil
+}
+```
+
+###### Ticket
+Filecoin区块头还包含一个由其epoch的信标项生成的“ticket”。在分叉选择规则中，ticket被用来打破分叉重量的相等的场景。
+
+每当比较Filecoin中的Ticket时，比较的是ticket的VRF摘要字节。
+
+* 随机性Ticket生成
+
+在Filecoin epoch n处，使用合适的信标项为epoch n生成一个新Ticket。
+
+矿工（区块生产者）通过可验证随机函数（Verifiable Random Function, VRF）运行信标项，以获得新的唯一Ticket。信标项以Ticket域分离标记为前缀，并与矿工（区块生产者）的actor地址连接（以确保使用相同worker密钥的矿工获得不同的ticket）。
+
+为给定的epoch n生成一个Ticket：
+
+```
+randSeed = GetRandomnessFromBeacon(n)
+newTicketRandomness = VRF_miner(H(TicketProdDST || index || Serialization(randSeed, minerActorAddress)))
+```
+
+生成Ticket使用的是（Verifiable Random Functions）。
+
+* Ticket验证
+
+每个Ticket都应该从VRF链中的前一个票证中生成，并进行相应的验证。
+
+
+
+###### 最小的矿工大小
+为了保证存储算力共识的安全性，Filecoin系统定义了参与共识所需的最小算力大小。
+
+具体来说，矿工（区块生产者）必须至少有一个MIN_MINER_SIZE_STOR的算力（即存储交易中目前使用的存储算力），才能参与领导者选举。如果没有矿工（区块生产者）具有MIN_MINER_SIZE_STOR或更大算力，则最大的MIN_MINER_SIZE_TARG（按存储功率排序）个矿工（区块生产者）将能够参加领导者选举。用简单的英语来说，以MIN_MINER_SIZE_TARG = 3为例，这意味着拥有至少是第三大矿工（区块生产者）才有资格参与共识。
+
+小于这个值的矿工不能生产区块，也不能网络中获得区块奖励。他们的算力仍将计入总网络（原始或声称的）存储算力，即使他们的算力不会被计入领导者选举的选票。然而，重要的是要注意，这样的矿工仍然可以有他们的算力故障和相应的惩罚。
+
+因此，要启动网络，创世区块必须包括初始化好的矿工，可能只是CommittedCapacity扇区，以启动网络。
+
+只要任何一个矿工（区块生产者）拥有超过MIN_MINER_SIZE_STOR算力，MIN_MINER_SIZE_TARG条件将不会在网络中使用。尽管如此，它仍被定义为确保小型网络（例如接近创世或在大量算力下降之后）的活性。
+
+
+
+###### Storage Power Actor
+
+StoragePowerActorState实现
+
+```
+type State struct {
+	TotalRawBytePower abi.StoragePower
+	// TotalBytesCommitted includes claims from miners below min power threshold
+	TotalBytesCommitted  abi.StoragePower
+	TotalQualityAdjPower abi.StoragePower
+	// TotalQABytesCommitted includes claims from miners below min power threshold
+	TotalQABytesCommitted abi.StoragePower
+	TotalPledgeCollateral abi.TokenAmount
+
+	// These fields are set once per epoch in the previous cron tick and used
+	// for consistent values across a single epoch's state transition.
+	ThisEpochRawBytePower     abi.StoragePower
+	ThisEpochQualityAdjPower  abi.StoragePower
+	ThisEpochPledgeCollateral abi.TokenAmount
+	ThisEpochQAPowerSmoothed  smoothing.FilterEstimate
+
+	MinerCount int64
+	// Number of miners having proven the minimum consensus power.
+	MinerAboveMinPowerCount int64
+
+	// A queue of events to be triggered by cron, indexed by epoch.
+	CronEventQueue cid.Cid // Multimap, (HAMT[ChainEpoch]AMT[CronEvent])
+
+	// First epoch in which a cron task may be stored.
+	// Cron will iterate every epoch between this and the current epoch inclusively to find tasks to execute.
+	FirstCronEpoch abi.ChainEpoch
+
+	// Claimed power for each miner.
+	Claims cid.Cid // Map, HAMT[address]Claim
+
+	ProofValidationBatch *cid.Cid // Multimap, (HAMT[Address]AMT[SealVerifyInfo])
+}
+```
+
+StoragePowerActor实现
+
+```
+func (a Actor) Exports() []interface{} {
+	return []interface{}{
+		builtin.MethodConstructor: a.Constructor,
+		2:                         a.CreateMiner,
+		3:                         a.UpdateClaimedPower,
+		4:                         a.EnrollCronEvent,
+		5:                         a.OnEpochTickEnd,
+		6:                         a.UpdatePledgeTotal,
+		7:                         nil, // deprecated
+		8:                         a.SubmitPoRepForBulkVerify,
+		9:                         a.CurrentTotalPower,
+	}
+}
+```
+
+MinerConstructorParams
+
+存储矿工（？？）actor的构造函数参数在这里定义，以便power actor可以将它们发送给init actor来实例化矿机。从v0以来已经有改变，增加了ControlAddrs：
+
+```
+type MinerConstructorParams struct {
+	OwnerAddr     addr.Address
+	WorkerAddr    addr.Address
+	ControlAddrs  []addr.Address
+	SealProofType abi.RegisteredSealProof
+	PeerId        abi.PeerID
+	Multiaddrs    []abi.Multiaddrs
+}
+```
+
+
+
+**算力表（PoS的关键组成部分）**
+
+一个给定的矿工（？？）通过EC中的领导者选举产生的区块的部分（所以他们所获得的区块奖励）与他们的质量调整后的算力比例（Quality-Adjusted Power Fraction）成正比。也就是说，如果一个矿工的质量调整算力代表了网络上总质量调整算力的1%，那么它应该按照预期生产1%的区块。
+
+SPC提供了一个算力表抽象，它可以随着时间的推移跟踪矿工（？？）的算力（即矿工存储与网络存储总量的关系)。算力表将针对新的扇区承诺（增加矿机算力）、失败的post（减少矿工算力）或其他存储和共识故障进行更新。
+
+Sector ProveCommit是第一次提交算力证明给网络，因此算力是第一次添加在成功的扇区ProveCommit。当一个扇区被宣布恢复时，算力也会被增加。矿工（？？）需要提交所有对算力有贡献的扇区的证明。
+
+当一个扇区过期，或者当一个扇区被声明或检测到故障，或者当它通过矿工（？？）调用被终止时，算力就会下降。矿工还可以通过ExtendSectorExpiration延长一个扇区的生命周期。
+
+power表中的Miner生命周期大致如下:
+
+* MinerRegistration：存储挖矿子系统将一个关联worker公钥和地址的新miner，以及它们关联的扇区大小（每个worker只有一个扇区大小）注册到power表中。
+* UpdatePower：这些算力的增加和减少由不同的存储Actor调用（因此必须由网络上的每个完整节点进行验证）。具体地说:
+  * 权力在SectorProveCommit增加
+  * 在错过WindowPoSt (DetectedFault)之后，分区所对应的算力立即下降（TODO：第二天才下降？）。
+  * 当通过“声明错误Declared Faults ”或“跳过错误Skipped Faults”进入故障状态时，特定扇区的算力会下降。
+  * 某一特定扇区被宣布恢复并被PoSt证实后，算力回归。
+  * 当某个特定扇区过期或者被矿工（？）宣布终止时，该扇区的算力将被取消。
+
+总而言之，只有处于Active状态的扇区才能控制算力。在ProveCommit上添加扇区时，扇区变为激活状态。当它进入故障状态时，算力立即减少。当宣布的恢复得到证实时，算力就会恢复。当一个扇区的算力过期或通过矿工（？？）调用终止时，它将被删除。
+
+**质押惩罚**
+对于任何影响存储算力共识的故障，抵押品被大幅削减，包括:
+
+* 特别是预期共识的错误（见共识错误），这将由一个slasher报告给StoragePowerActor以换取奖励。
+* 影响算力共识更普遍的故障，特别是未提交算力故障（即存储故障），这将由CronActor自动报告或当矿工早于其承诺的持续时间终止一个扇区。
+
+有关质押的更详细的讨论，请参阅矿工质押部分。
